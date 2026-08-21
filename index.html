@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Punkte-Karte (Offline)</title>
+<link rel="manifest" href="manifest.json">
+<link rel="stylesheet" href="vendor/leaflet.css">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  #map { position: absolute; top: 0; bottom: 0; width: 100%; z-index: 1; }
+
+  #topbar {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 1000;
+    background: #1b1b1b; color: #fff; padding: 8px 12px;
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 14px;
+  }
+  #topbar select {
+    background: #2b2b2b; color: #fff; border: 1px solid #444;
+    border-radius: 6px; padding: 5px 8px; font-size: 14px;
+  }
+  #status { font-size: 12px; color: #aaa; }
+
+  #panel {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 1000;
+    background: #fff; border-top-left-radius: 14px; border-top-right-radius: 14px;
+    box-shadow: 0 -2px 12px rgba(0,0,0,0.25);
+    max-height: 46%; overflow-y: auto; transition: transform .2s ease;
+  }
+  #panel.collapsed { transform: translateY(calc(100% - 46px)); }
+  #panelHandle {
+    height: 46px; display: flex; align-items: center; justify-content: center;
+    cursor: pointer; font-weight: 600; color: #333; border-bottom: 1px solid #eee;
+  }
+  #panelHandle .bar { width: 40px; height: 4px; background: #ccc; border-radius: 2px; position: absolute; top: 8px; }
+
+  .point-card {
+    padding: 12px 16px; border-bottom: 1px solid #f0f0f0;
+    display: flex; align-items: center; gap: 12px; cursor: pointer;
+  }
+  .point-card:active { background: #f7f7f7; }
+  .point-info { flex: 1; }
+  .point-name { font-weight: 600; font-size: 15px; color: #1b1b1b; }
+  .point-desc { font-size: 12px; color: #777; margin-top: 2px; }
+  .point-dist { font-size: 13px; color: #d7263d; font-weight: 600; white-space: nowrap; }
+
+  #navbox {
+    position: absolute; top: 56px; right: 10px; z-index: 1000;
+    background: #fff; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,.2);
+    padding: 12px; width: 150px; text-align: center; display: none;
+  }
+  #navbox.active { display: block; }
+  #navbox .target-name { font-size: 12px; font-weight: 600; margin-bottom: 6px; color: #333; }
+  #compassArrow { font-size: 42px; transition: transform .15s linear; display: inline-block; }
+  #navDist { font-size: 20px; font-weight: 700; color: #d7263d; margin-top: 4px; }
+  #navLinks { margin-top: 8px; display: flex; gap: 6px; justify-content: center; }
+  #navLinks a {
+    font-size: 11px; text-decoration: none; background: #2b6cb0; color: #fff;
+    padding: 5px 8px; border-radius: 6px;
+  }
+  #navLinks a.geoadmin { background: #d7263d; }
+  #navLinks a.swisstopo { background: #e8630a; }
+  #navClose {
+    position: absolute; top: 4px; right: 8px; font-size: 16px; color: #999;
+    cursor: pointer; border: none; background: none;
+  }
+
+  .leaflet-div-icon.mypos {
+    background: #2b6cb0; border: 3px solid #fff; border-radius: 50%;
+    box-shadow: 0 0 0 4px rgba(43,108,176,0.25);
+  }
+  .leaflet-div-icon.poi {
+    background: #d7263d; border: 2px solid #fff; border-radius: 50%;
+  }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div>
+    <select id="gemeindeSelect"></select>
+  </div>
+  <div id="status">Standort wird gesucht…</div>
+</div>
+
+<div id="map"></div>
+
+<div id="navbox">
+  <button id="navClose">✕</button>
+  <div class="target-name" id="navTargetName">–</div>
+  <div id="compassArrow">⬆️</div>
+  <div id="navDist">–</div>
+  <div id="navLinks">
+    <a id="linkSwisstopo" class="swisstopo" href="#">Swisstopo App</a>
+    <a id="linkGmaps" class="gmaps" href="#" target="_blank">Google Maps</a>
+    <a id="linkGeoadmin" class="geoadmin" href="#" target="_blank">map.geo.admin.ch</a>
+  </div>
+</div>
+
+<div id="panel">
+  <div id="panelHandle"><div class="bar"></div>&nbsp;</div>
+  <div id="pointList"></div>
+</div>
+
+<script src="vendor/leaflet.js"></script>
+<script src="data.js"></script>
+<script>
+/* ======================= State ======================= */
+let map, myMarker, accuracyCircle, poiLayer = {};
+let myPos = null;           // {lat, lon}
+let heading = null;         // Grad, 0 = Norden
+let activeTarget = null;    // Punkt-Objekt, fuer den navigiert wird
+let currentGemeinde = null;
+
+/* ======================= Karte init ======================= */
+function initMap() {
+  map = L.map('map', { zoomControl: true }).setView([46.8182, 8.2275], 8); // CH-Mitte als Start
+
+  // Lokale, vorab gecachte OSM-Kacheln (Service Worker cached diese Tiles).
+  // WICHTIG: fuer den gewuenschten Bereich vorab einmal online durchzoomen,
+  // damit der Service Worker die Kacheln im Cache ablegt (siehe README).
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap-Mitwirkende'
+  }).addTo(map);
+
+  populateGemeindeSelect();
+  loadGemeinde(Object.keys(PUNKTE)[0]);
+  startGeolocation();
+
+  document.getElementById('gemeindeSelect').addEventListener('change', e => {
+    loadGemeinde(e.target.value);
+  });
+  document.getElementById('panelHandle').addEventListener('click', () => {
+    document.getElementById('panel').classList.toggle('collapsed');
+  });
+  document.getElementById('navClose').addEventListener('click', () => {
+    activeTarget = null;
+    document.getElementById('navbox').classList.remove('active');
+  });
+}
+
+function populateGemeindeSelect() {
+  const sel = document.getElementById('gemeindeSelect');
+  Object.keys(PUNKTE).forEach(g => {
+    const opt = document.createElement('option');
+    opt.value = g; opt.textContent = g;
+    sel.appendChild(opt);
+  });
+}
+
+/* ======================= Punkte einer Gemeinde laden ======================= */
+function loadGemeinde(gemeinde) {
+  currentGemeinde = gemeinde;
+  document.getElementById('gemeindeSelect').value = gemeinde;
+
+  Object.values(poiLayer).forEach(m => map.removeLayer(m));
+  poiLayer = {};
+
+  const pts = PUNKTE[gemeinde] || [];
+  const bounds = [];
+  pts.forEach((p, i) => {
+    const icon = L.divIcon({ className: 'leaflet-div-icon poi', iconSize: [16, 16] });
+    const marker = L.marker([p.lat, p.lon], { icon }).addTo(map);
+    marker.bindPopup(`<b>${p.name}</b><br>${p.beschreibung || ''}${formatExtras(p.extras)}`);
+    marker.on('click', () => selectTarget(p));
+    poiLayer[i] = marker;
+    bounds.push([p.lat, p.lon]);
+  });
+  if (bounds.length) map.fitBounds(bounds, { padding: [40, 80] });
+
+  renderList(pts);
+}
+
+function formatExtras(extras) {
+  if (!extras) return '';
+  return Object.entries(extras)
+    .map(([k, v]) => `<br><small><b>${k}:</b> ${v}</small>`)
+    .join('');
+}
+
+function renderList(pts) {
+  const list = document.getElementById('pointList');
+  list.innerHTML = '';
+  pts.forEach(p => {
+    const card = document.createElement('div');
+    card.className = 'point-card';
+    const dist = myPos ? formatDist(distanceMeters(myPos.lat, myPos.lon, p.lat, p.lon)) : '–';
+    card.innerHTML = `
+      <div class="point-info">
+        <div class="point-name">${p.name}</div>
+        <div class="point-desc">${p.beschreibung || ''}</div>
+      </div>
+      <div class="point-dist">${dist}</div>`;
+    card.addEventListener('click', () => {
+      map.setView([p.lat, p.lon], 17);
+      selectTarget(p);
+    });
+    list.appendChild(card);
+  });
+}
+
+/* ======================= Eigener Standort ======================= */
+function startGeolocation() {
+  if (!navigator.geolocation) {
+    document.getElementById('status').textContent = 'Geolocation nicht verfuegbar';
+    return;
+  }
+  navigator.geolocation.watchPosition(pos => {
+    myPos = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+    updateMyMarker(pos.coords.accuracy);
+    document.getElementById('status').textContent =
+      `Standort: ±${Math.round(pos.coords.accuracy)} m`;
+    renderList(PUNKTE[currentGemeinde] || []);
+    if (activeTarget) updateNavBox();
+  }, err => {
+    document.getElementById('status').textContent = 'Standort nicht verfuegbar: ' + err.message;
+  }, { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 });
+
+  // Kompass (Geraete-Ausrichtung) - iOS braucht ggf. Berechtigung on-demand
+  if (typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof DeviceOrientationEvent.requestPermission === 'function') {
+    document.body.addEventListener('click', requestCompassPermission, { once: true });
+  } else {
+    window.addEventListener('deviceorientationabsolute', onOrientation, true);
+    window.addEventListener('deviceorientation', onOrientation, true);
+  }
+}
+
+function requestCompassPermission() {
+  DeviceOrientationEvent.requestPermission().then(state => {
+    if (state === 'granted') {
+      window.addEventListener('deviceorientation', onOrientation, true);
+    }
+  }).catch(() => {});
+}
+
+function onOrientation(e) {
+  if (e.webkitCompassHeading !== undefined) {
+    heading = e.webkitCompassHeading;          // iOS: bereits 0=Norden
+  } else if (e.alpha !== null) {
+    heading = 360 - e.alpha;                    // Android-Naeherung
+  }
+  if (activeTarget) updateNavBox();
+}
+
+function updateMyMarker(accuracy) {
+  const icon = L.divIcon({ className: 'leaflet-div-icon mypos', iconSize: [18, 18] });
+  if (!myMarker) {
+    myMarker = L.marker([myPos.lat, myPos.lon], { icon }).addTo(map);
+  } else {
+    myMarker.setLatLng([myPos.lat, myPos.lon]);
+  }
+  if (!accuracyCircle) {
+    accuracyCircle = L.circle([myPos.lat, myPos.lon], { radius: accuracy, color: '#2b6cb0', weight: 1, fillOpacity: 0.08 }).addTo(map);
+  } else {
+    accuracyCircle.setLatLng([myPos.lat, myPos.lon]).setRadius(accuracy);
+  }
+}
+
+/* ======================= Navigation (Kompass + Luftlinie) ======================= */
+function selectTarget(p) {
+  activeTarget = p;
+  document.getElementById('navbox').classList.add('active');
+  document.getElementById('navTargetName').textContent = p.name;
+  document.getElementById('linkSwisstopo').href =
+    `swisstopo://poi?lat=${p.lat}&lon=${p.lon}`;
+  document.getElementById('linkGmaps').href =
+    `https://www.google.com/maps?q=${p.lat},${p.lon}`;
+  document.getElementById('linkGeoadmin').href = geoAdminLink(p.lat, p.lon);
+  updateNavBox();
+}
+
+/* ---- WGS84 -> LV95 (Schweizer Landeskoordinaten), swisstopo-Naeherungsformel ----
+   map.geo.admin.ch erwartet seit dem URL-Update 2024 den Parameter "center"
+   in LV95-Metern (EPSG:2056), nicht in WGS84-Gradzahlen. Ohne diese Umrechnung
+   zeigt die Karte "Fehler: center ist kein gueltiger Wert" und springt an
+   einen falschen Ort. Genauigkeit der Naeherung: ca. 1 Meter. */
+function wgs84ToLv95(lat, lon) {
+  const phi = lat * 3600;
+  const lam = lon * 3600;
+  const phiP = (phi - 169028.66) / 10000;
+  const lamP = (lam - 26782.5) / 10000;
+
+  const E = 2600072.37
+    + 211455.93 * lamP
+    - 10938.51 * lamP * phiP
+    - 0.36 * lamP * phiP ** 2
+    - 44.54 * lamP ** 3;
+
+  const N = 1200147.07
+    + 308807.95 * phiP
+    + 3745.25 * lamP ** 2
+    + 76.63 * phiP ** 2
+    - 194.56 * lamP ** 2 * phiP
+    + 119.79 * phiP ** 3;
+
+  return { E: Math.round(E), N: Math.round(N) };
+}
+
+function geoAdminLink(lat, lon) {
+  const { E, N } = wgs84ToLv95(lat, lon);
+  return `https://map.geo.admin.ch/#/map?center=${E},${N}&z=10&crosshair=marker&swisssearch=${E},${N}`;
+}
+
+function updateNavBox() {
+  if (!activeTarget) return;
+  if (myPos) {
+    const d = distanceMeters(myPos.lat, myPos.lon, activeTarget.lat, activeTarget.lon);
+    document.getElementById('navDist').textContent = formatDist(d);
+    const bearing = bearingDeg(myPos.lat, myPos.lon, activeTarget.lat, activeTarget.lon);
+    const rot = heading !== null ? (bearing - heading + 360) % 360 : bearing;
+    document.getElementById('compassArrow').style.transform = `rotate(${rot}deg)`;
+  } else {
+    document.getElementById('navDist').textContent = 'kein Standort';
+  }
+}
+
+function distanceMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function bearingDeg(lat1, lon1, lat2, lon2) {
+  const toRad = d => d * Math.PI / 180, toDeg = r => r * 180 / Math.PI;
+  const y = Math.sin(toRad(lon2 - lon1)) * Math.cos(toRad(lat2));
+  const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+            Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(toRad(lon2 - lon1));
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+function formatDist(m) {
+  return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(2)} km`;
+}
+
+/* ======================= Service Worker (Offline-Cache) ======================= */
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  });
+}
+
+initMap();
+</script>
+</body>
+</html>

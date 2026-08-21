@@ -1,0 +1,9 @@
+{
+  "name": "Punkte-Karte Offline",
+  "short_name": "Punkte",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#1b1b1b",
+  "icons": []
+}
